@@ -1,0 +1,407 @@
+{
+	"auto_complete":
+	{
+		"selected_items":
+		[
+			[
+				"re",
+				"reset-btn"
+			]
+		]
+	},
+	"buffers":
+	[
+		{
+			"contents": "#!/bin/sh\n#\n#   MonitorS3\n#       a script to monitoring the SSC S3 storage service for up/degraded/down availability\n#\nusage() {\ncat - <<HERE\nUsage:\n    -i		Initialize: create all the required buckets and objects (all the same (15kb and filled with bits from /dev/zero...))\n    -r		Remove:     cleanup all the s3 artifacts created by -i\n    -n#		NumProbes:  change the number of probes from the default 3 to something else\n    -l		List:       show configuration and info about the objects\n    -v		Verbose:    show all the s3 buckets and objects in addition to -l\n    -d		Debug:	    show commands being used\n    -c <file>	ConfigFile: specify the config file to be used\n    -2		Only2:      only return the two values UP/DOWN (DEGRADED maps to UP...)\n    -s		Syslog:	    send output to syslog\n    -q		quiet:	    don't print output to screen\n    -t		Time:	    report execution times in mS\n    -h		Help:	    display this message\n\n    run without any options to probe 3 random buckets/objects\n\n    returns\n	UP		- all probed objects were successfully accessed\n	DEGRADED	- at least ONE object was successfully accessed, but others failed\n	DOWN		- all object accesses failed\nHERE\n    exit 1;\n}\n\nlogger=logger\ns3cmd=s3cmd\ns3cmd_config=\".s3cfg\"\nlogger_tag='[SSC]'\n\nnumprobes=3		# default number of objects to probe\n\nbucketname=\"my-test-bucket-\"\nbucketlist=\"00 01 02 03 04 05 06 07 08 09 10 11\"\n\nobjectname=\"my-test-object-\"\nobjectlist=\"00 01 02 03 04 05 06 07 08 09 10 11\"\n\ndo_s3 () {\n    cmd=$1; shift\n    arg=$@\n    if [ $debug -eq 1 ]; then\n	>&2 echo -n \"+s3cmd $cmd $arg => \"\n    fi\n    r=`$s3cmd -c $s3cmd_config $cmd $arg 2>&1`\n    if [ $debug -eq 1 ]; then\n        >&2 echo $r\n    fi\n    echo \"$r\"\n}\n\nerror () {\n    echo \"Error: $1\"\n    exit 1\n}\n \n\nmbname=\"${bucketname}00\"\nmname=\"${mbname}/${objectname}master\"\ntemp_file=\"/tmp/object-$$\"\nfile_size=15k\n\ninitialize_master_object () {\n    cc=`do_s3 ls s3://$mname`\n    if [ -z \"$cc\" ]; then \n	# need to create it...\n	cmd=\"dd if=/dev/zero of=$temp_file count=1 bs=$file_size\"\n	if [ $debug -eq 1 ]; then\n	    >&2 echo -n \"+$cmd => \"\n	fi\n	$cmd > /dev/null 2>&1\n	if [ ! -f $temp_file ]; then\n	    if [ $debug -eq 1 ]; then\n		>&2 echo \"ERROR: could not create\"\n	    fi\n	    error \"$cmd => ERROR: could not create\"\n	fi\n\n        # TODO: need better error checking here...\n	cc=`do_s3 put --no-guess-mime-type --no-progress $temp_file s3://${mname}`\n	if [ -n \"$cc\" ]; then\n	    error \"s3cmd put $temp_file s3://${mname} => ERROR: could not put master object: $cc\"\n	fi\n	/bin/rm -f $temp_file\n    fi\n}\n\ninitialize_buckets () { \n    for b in $bucketlist; do\n	bname=\"${bucketname}${b}\"\n	cc=`do_s3 info s3://$bname | head -1 | awk '{ print $1 }'`\n	if [ -n $cc -a \"$cc\" = \"ERROR:\" ]; then\n		cc=`do_s3 mb s3://$bname`\n		echo $cc\n	fi\n	# validate successful bucket creation\n	cc=`do_s3 info s3://$bname | head -1 | awk '{ print $1 }'`\n	if [ -n $cc -a \"$cc\" = \"ERROR:\" ]; then\n		error \"s3cmd mb s3://$bname => $cc could not create bucket\"\n	fi\n    done\n}\n\ninitialize_objects () { \n    # first create a master object if needed, then put-copy it to various other places/names...\n\n    for b in $bucketlist; do\n	bname=\"${bucketname}${b}\"\n	cc=`do_s3 info s3://$bname | head -1 | awk '{ print $1 }'`\n	if [ -n $cc -a \"$cc\" = \"ERROR:\" ]; then\n		error \"s3cmd info s3://$bname => $cc required bucket does not exist\"\n	fi\n	# bucket exists, now fill it\n	for o in $objectlist ; do\n            oname=\"${bname}/${objectname}${o}\"\n            cc=`do_s3 ls s3://$oname`\n            if [ -z \"$cc\" ]; then \n                cc=`do_s3 cp s3://${mname} s3://${oname}`\n                cch=`echo $cc |head -1 | awk '{ print $1 }'`\n		if [ \"File\" != \"$cch\" ]; then\n		    error \"s3cmd cp s3://${mname} s3://${oname} => $cc could not copy master object into bucket...\"\n	        else\n		    echo $cc\n		fi\n	    fi\n	done\n    done\n}\n\ndelete_all_objects () { \n    for b in $bucketlist; do\n	bname=\"${bucketname}${b}\"\n	cc=`do_s3 info s3://$bname | head -1 | awk '{ print $1 }'`\n	if [ -n $cc -a \"$cc\" = \"ERROR:\" ]; then\n		: # missing buckets are OK...\n	else\n		# bucket exists, now empty it\n		for o in $objectlist ; do\n		    oname=\"${bname}/${objectname}${o}\"\n		    cc=`do_s3 ls s3://$oname`\n		    if [ -n \"$cc\" ]; then \n			echo \"Deleting object: s3cmd del s3://$oname\"\n			# cc=`do_s3 del s3://${oname} |head -1 | awk '{ print $1 }'`\n			do_s3 del s3://${oname}\n		    fi\n		done\n		# delete the bucket...\n		do_s3 rb s3://${bname}\n	fi\n    done\n    # and delete the master object...\n    # do_s3 del s3://${mname}\n}\n\n# Random bucket/object generator - could probably be improved...\n# shuffle the list of (buckets, nodes) and randomly pick one\n#\n# usage: randomize <... list of buckets or objects ...> => one item from list\nrandomize () {\n    echo \"$@\" | tr \" \" \"\\n\" | shuf -n1\n}\n\n# ------------------------\n\ndo_remove () {\n	echo \"cleaning up...\"\n        delete_all_objects\n}\n\ndo_install () {\n	echo \"initializing...\"\n	echo \"... master object\"\n	initialize_master_object\n	echo \"... buckets\"\n	initialize_buckets\n	echo \"... copying objects\"\n	initialize_objects\n}\n\ndo_list () {\n	verbose=$1\n\n	echo \"Configuration:\"\n	printf \"    %12s = %s\\n\"    s3cmd_config	\"$s3cmd_config\"\n	if [ ! -f $s3cmd_config ]; then\n	    error \"ERROR: s3cmd config file does not exist: $s3cmd_config\"\n	fi\n	region=`grep \"^host_base\" $s3cmd_config | awk '{ print $3 }'`\n	printf \"    %12s = %s\\n\"    region	\"$region\"\n	printf \"    %12s = %s\\n\"    numprobes	\"$numprobes\"\n	printf \"    %12s = %s\\n\"    bucketname	\"$bucketname\"\n	printf \"    %12s = %s\\n\"    bucketlist	\"$bucketlist\"\n	printf \"    %12s = %s\\n\"    objectname	\"$objectname\"\n	printf \"    %12s = %s\\n\"    objectlist	\"$objectlist\"\n\n	if [ \"full\" = \"$verbose\" ]; then\n		echo \"Storage system:\"\n		blist=`do_s3 ls  | grep ${bucketname} | awk '{ print $3 }'`\n		if [ -z \"$blist\" ]; then\n			echo \"    No buckets to list...\"\n		else\n			for b in $blist; do\n				do_s3 info $b\n				do_s3 ls   $b\n			done\n		fi\n	fi\n	cc=`do_s3 info s3://${mbname}`\n	cch=`echo \"$cc\" | awk '{print $1 }'`\n	if [ \"$cch\" != \"ERROR:\" ]; then\n		echo \"Storage system (template object...):\"\n		do_s3 info s3://${mname}\n	fi\n}\n\ndo_probes () {\n	probes=$1\n	twostate=$2\n	extended=$3\n	config=$4\n\n	result=\"\"\n	worstresult=\"\"\n	failedlist=\"\"\n	rl=\"\"\n\n	start_time=`date \"+%s%N\" | sed s/......$//g`\n	date=`date \"+20%y%d%m-%H%M%S\"`\n\n	while [ $probes -gt 0 ]; do\n		b=`randomize ${bucketlist}`	# get a random bucket name\n		o=`randomize ${objectlist}` 	# and object...\n		# list of probed objects...\n		rl=\"${rl} $b/$o\"\n\n		cc=`checkit $b $o`\n\n		# actual results (empty $cc means OK)\n		result=\"${result}${cc}\"\n\n		if [ -n \"$cc\" ]; then\n			# list of failed objects\n			failedlist=\"${failedlist}$b/$o  \"\n		fi\n		# for comparison later, a list of worst failure case\n		worstresult=\"${worstresult}FAIL\"\n\n		probes=`expr $probes - 1`\n	done\n\n	## calc execution time\n	msg=\"\"\n	if [ \"$report_exec_time\" -eq \"1\" ];then\n		end_time=`date \"+%s%N\" | sed s/......$//g`\n		delay=`expr $end_time - $start_time`\n		msg=\"exectime: $delay msec.\"\n	fi\n	 \n	if [ -z \"$result\" ]; then		  # empty is good...\n	    report_success=1\n	    warning=0\n	    critical=0\n\n	    STATUS=\"UP\"\n	    failedlist=\" -none-\"\n	elif [ \"$result\" = \"$worstresult\" ]; then # worst case, everything failed\n	    report_success=0\n	    warning=0\n	    critical=1\n\n	    STATUS=\"DOWN\"\n	else					  # mixed bag\n	    report_success=0\n	    warning=1\n	    critical=0\n\n	    if [ $twostate -eq 0 ]; then\n		STATUS=\"DEGRADED\"\n	    else				  # map DEGRADED to UP state\n	        report_success=1\n	        warning=0\n	        STATUS=\"UP\"\n	    fi\n	fi\n\n	vfmt=\"%-10s %s (%s)%s Probed:%s Failed:%s\\n\"\n	sfmt=\"%-10s %s (%s)%s\\n\"\n\n        if [ $extended -eq 1 ]; then\n	    output=`printf \"$vfmt\" \"$STATUS\" \"$date\" \"$config\" \"$msg\" \"${rl}\" \"${failedlist}\"`\n	else\n	    output=`printf \"$sfmt\" \"$STATUS\" \"$date\" \"$config\" \"$msg\"`\n	fi\n\n	## Report status\n	if [ \"$critical\" -ge '1' ];then\n		[ \"$show_output\" -eq \"1\" ] && (echo Message:CRITICAL $output; echo Statistic:3)\n		[ \"$use_logging\" -eq \"1\" ] && (logger_loglevel='daemon.crit';echo \"CRITICAL $output\"| $logger -t $logger_tag -p $logger_loglevel)\n		exit 3\n	elif [ \"$warning\" -ge '1' ];then\n		[ \"$show_output\" -eq \"1\" ] && (echo Message:WARNING $output; echo Statistic:2)\n		[ \"$use_logging\" -eq \"1\" ] && (logger_loglevel='daemon.warning';echo \"WARNING $output\"| $logger -t $logger_tag -p $logger_loglevel)\n		exit 2\n	elif [ $report_success -eq \"1\" ];then\n		[ \"$show_output\" -eq \"1\" ] && (echo Message:OK $output; echo Statistic:0)\n		[ \"$use_logging\" -eq \"1\" ] && (logger_loglevel='daemon.notice';echo \"OK $output\"| $logger -t $logger_tag -p $logger_loglevel)\n		exit 0\n	else\n		# go quietly...\n		exit 0\n	fi\n}\n\ncheckit () {\n    # check an object...\n    bucket=$1\n    object=$2\n\n    oname=\"${bucketname}${bucket}/${objectname}${object}\"\n    cc=`do_s3 ls s3://$oname`\n    if [ -z \"$cc\" ]; then \n	echo \"FAIL\"\n    else\n	lines=`echo \"$cc\" | wc -l`\n	if [ $lines -gt 1 ]; then\n		echo \"FAIL\"\n	else \n		up=`echo \"$cc\" | head -1 | awk '{ print $1 }'`\n		if [ \"$up\" = \"ERROR:\" ]; then\n			echo \"FAIL\"\n		fi\n        fi\n    fi\n}\n\nTWOSTATE=0\nEXTENDEDRESULTS=0\ndebug=0\nreport_exec_time=0\nuse_logging=0\nshow_output=1\n\nwhile getopts \":h2sqtdVvlirn:c:\" opt; do\n  case $opt in\n    h)  usage\n	;;\n    2)  TWOSTATE=1\n	;;\n    d)  debug=1\n	;;\n    V)  EXTENDEDRESULTS=1\n	;;\n    r)	# Remove everything...\n	do_remove\n	do_list full\n	exit 0\n        ;;\n    t)  # report execution time\n        report_exec_time=1\n	;;\n    i)	# install everything...\n	do_install\n	do_list \"\"\n	exit 0\n        ;;\n    v)  do_list full\n	exit 0\n        ;;\n    s)  use_logging=1\n	;;\n    q)  show_output=0\n        ;;\n    l)  do_list \"\"\n	exit 0\n        ;;\n    n)  numprobes=$OPTARG\n        ;;\n    c)  # config file...\n	s3cmd_config=$OPTARG\n	if [ ! -f $s3cmd_config ]; then\n		error \"ERROR: User supplied s3cmd config file does not exist: $s3cmd_config\"\n	fi\n        ;;\n    \\?)\n        echo \"Invalid option: -$OPTARG\" >&2\n        ;;\n  esac\ndone\nif [ ! -f $s3cmd_config ]; then\n    error \"ERROR: Default s3cmd config file does not exist: $s3cmd_config\"\nfi\n\n# probe:\n\ndo_probes $numprobes $TWOSTATE $EXTENDEDRESULTS \"$s3cmd_config\"\n\n\n",
+			"file": "/C/Users/Michael/OneDrive/Downloads/monitorS3 (1)",
+			"file_size": 10058,
+			"file_write_time": 130855112579846681,
+			"settings":
+			{
+				"buffer_size": 10058,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"contents": "#!/bin/bash\n#\n#   Scality check RS2  is a script to help monitoring your RS2/S3 service.\n#   It could send the ring status to syslog (using different priorities\n#   levels), to Zabbix.\n#\n\ntemp_file=.scality-file-for-monitoring-please-dont-remove-west-solarwinds\nfile_size=15KB\ns3cmd_config=\".s3cfg-scality-monitoring-west\"\ns3_bucket=\"s3://scality-bucket-for-monitoring-please-dont-remove\" # Bucket has to exist\ns3_file=\"$s3_bucket/temp_file\"\nlogger_tag='[scality_rs2_west]'\nuse_logging=0 # result sent to syslog, enable in debug mode\nshow_output=1 # result sent to output, enable in debug mode. To be enable for Nagios reporting\nreport_success=1 # report success results, enable in debug mode\nreport_exec_time=0 # report script execution time\nwarning=0 ; critical=0\nmd5sum=`which md5sum`\ns3cmd=`which s3cmd`\nlogger=`which logger`\nsed=`which sed`\nstart_time=$(date +%s%N|$sed s/......$//g)\n\n\n## Create a random file and get file's cheksum\ndd if=/dev/urandom of=$temp_file count=1 bs=$file_size >/dev/null 2>&1\norig_checksum=`$md5sum $temp_file|awk '{print $1}'`\n\n## Main test  (upload,info,get,delete)\n# Upload file\nif upload_file=`$s3cmd -c $s3cmd_config put $temp_file $s3_file 2>&1`;then\n    # Get remote checksum using s3 protocol\n    if info_file=`$s3cmd -c $s3cmd_config ls $s3_file --list-md5 2>&1`;then\n        remote_checksum=`echo $info_file | cut -c24-55`\n        # Compare checksum with original file\n        if [ \"$orig_checksum\" != \"$remote_checksum\" ];then\n            msg=\"$msg- Error: S3 checksum and local file checksum differ \"\n            let warning+=1\n        fi\n    else\n        msg=\"$msg- Error: Info command failed, msg: $info_file \"\n        let critical+=1\n    fi\n    # Get remote file and compare it with local file\n    if download_file=`$s3cmd -c $s3cmd_config --force get $s3_file $temp_file.from.s3 2>&1`;then\n        # Compare checksum with original file\n        retr_checksum=`$md5sum $temp_file.from.s3|awk '{print $1}'`\n        if [ \"$retr_checksum\" != \"$orig_checksum\" ];then\n            msg=\"$msg- Error: Remote file checksum and local file checksum differ \"\n            let warning+=1\n        fi\n    else\n        msg=\"$msg- Error: Download file failed, msg: $download_file \"\n        let critical+=1\n    fi\n    # Delete remote file\n    if ! delete_file=`$s3cmd -c $s3cmd_config del $s3_file 2>&1`;then\n        msg=\"$msg- Error: Delete command failed, msg: $delete_file \"\n        let critical+=1\n    fi\n    # Remove local files\n    rm -f $temp_file $temp_file.from.s3\nelse\n    msg=\"$msg- Error: Upload command failed, msg: $upload_file \"\n    let critical+=1\nfi\n \n## Report execution time\nif [ \"$report_exec_time\" -eq \"1\" ];then\n        end_time=$(date +%s%N|$sed s/......$//g)\n        delay=$(($end_time - $start_time))\n        msg=\"$msg- exectime: $delay msec.\"\nfi\n \n## Report status\nmsg=$(echo \"$msg\"|tr '\\n' ' ')\nif [ \"$critical\" -ge '1' ];then\n        [ \"$show_output\" -eq \"1\" ] && echo Message:CRITICAL-$msg; echo Statistic:3\n        [ \"$use_logging\" -eq \"1\" ] && (logger_loglevel='daemon.crit';echo \"RS2 CRITICAL $msg\"| $logger -t $logger_tag -p $logger_loglevel)\n        exit 3\nelif [ \"$warning\" -ge '1' ];then\n        [ \"$show_output\" -eq \"1\" ] && echo Message:WARNING-$msg; echo Statistic:2\n        [ \"$use_logging\" -eq \"1\" ] && (logger_loglevel='daemon.warning';echo \"RS2 WARNING $msg\"| $logger -t $logger_tag -p $logger_loglevel)\n        exit 2\nelse\n        if [ $report_success -eq \"1\" ];then\n                [ \"$show_output\" -eq \"1\" ] && echo Message:RS2 OK; echo Statistic:0\n                [ \"$use_logging\" -eq \"1\" ] && (logger_loglevel='daemon.notice';echo \"RS2 OK $msg\"| $logger -t $logger_tag -p $logger_loglevel)\n                exit 0\n        fi\nfi",
+			"settings":
+			{
+				"buffer_size": 3702,
+				"line_ending": "Windows"
+			}
+		},
+		{
+			"contents": "s3cmd -c  east.s3cfg ls\n\n\ntemp_file=.scality-file-for-monitoring-please-dont-remove-west-solarwinds\nfile_size=15KB\ns3cmd_config=\".s3cfg-scality-monitoring-west\"\ns3_bucket=\"s3://scality-bucket-for-monitoring-please-dont-remove\" # Bucket has to exist\ns3_file=\"$s3_bucket/temp_file\"\nlogger_tag='[scality_rs2_west]'\nuse_logging=0 # result sent to syslog, enable in debug mode\nshow_output=1 # result sent to output, enable in debug mode. To be enable for Nagios reporting\nreport_success=1 # report success results, enable in debug mode\nreport_exec_time=0 # report script execution time\nwarning=0 ; critical=0\nmd5sum=`which md5sum`\ns3cmd=`which s3cmd`\nlogger=`which logger`\nsed=`which sed`\nstart_time=$(date +%s%N|$sed s/......$//g)\n\n\n## Create a random file and get file's cheksum\ndd if=/dev/urandom of=$temp_file count=1 bs=$file_size >/dev/null 2>&1\norig_checksum=`$md5sum $temp_file|awk '{print $1}'`\n\n## Main test  (upload,info,get,delete)\n# Upload file\nif upload_file=`$s3cmd -c $s3cmd_config put $temp_file $s3_file 2>&1`;then\n    # Get remote checksum using s3 protocol\n    if info_file=`$s3cmd -c $s3cmd_config ls $s3_file --list-md5 2>&1`;then\n        remote_checksum=`echo $info_file | cut -c24-55`\n        # Compare checksum with original file\n        if [ \"$orig_checksum\" != \"$remote_checksum\" ];then\n            msg=\"$msg- Error: S3 checksum and local file checksum differ \"\n            let warning+=1\n        fi\n    else\n        msg=\"$msg- Error: Info command failed, msg: $info_file \"\n        let critical+=1",
+			"settings":
+			{
+				"buffer_size": 1519,
+				"line_ending": "Windows"
+			}
+		},
+		{
+			"contents": "<html>\n<head>\n  <title class=\"blog-title\">My blog</title>\n</head>\n<body>\n  <div id=\"blog-post-1\" class=\"blog-post\">\n    <h1 class=\"blog-post-title\">Blog post 1</h1>\n    <div class=\"blog-text\">\n      <p class=\"blog-p\">\n        Lorem ipsum dolor sit amet, consectetur adipisicing elit. Impedit magnam sunt id distinctio repellat odio aut iusto maxime, rerum perspiciatis veritatis perferendis fuga quasi deserunt ut, necessitatibus cum corporis harum voluptas dolorem vel repudiandae autem mollitia. Voluptates, ducimus tempore laboriosam.\n      </p>\n      <p class=\"blog-p\">\n        Lorem ipsum dolor sit amet, consectetur adipisicing elit. Incidunt odio pariatur nulla. Aliquid laudantium vel ullam asperiores, rem illum, quidem dolore ab id officia labore assumenda dolores obcaecati perspiciatis, accusamus!\n      </p>\n      <p class=\"blog-p\">\n        Lorem ipsum dolor sit amet, consectetur adipisicing elit. Voluptatem distinctio totam veniam ipsam labore debitis laboriosam mollitia. Sit, iusto, laudantium!\n      </p>\n    </div>\n  </div>\n  <div id=\"blog-post-2\" class=\"blog-post\">\n    <h1 class=\"blog-post-title\">Blog post 2</h1>\n    <div class=\"blog-text\">\n      <p class=\"blog-p\">\n        Lorem ipsum dolor sit amet, consectetur adipisicing elit. Corporis placeat veritatis saepe similique ab nemo a eius, quo accusamus maxime, cum molestiae amet quisquam exercitationem perferendis esse non expedita ad minus, nesciunt quas odio. Sapiente!\n      </p>\n      <p class=\"blog-p\">\n        Lorem ipsum dolor sit amet, consectetur adipisicing elit. Quod est, illo debitis, dolore explicabo rerum nemo, earum, cupiditate ducimus odit hic voluptas. Non, numquam dolorum eos iure amet optio aspernatur porro quasi rem, qui, provident, earum maiores perferendis illum repudiandae.\n      </p>\n      <p class=\"blog-p\">\n        Lorem ipsum dolor sit amet, consectetur adipisicing elit. Maiores iure ipsum suscipit minima obcaecati nostrum magni et dignissimos dolorum repudiandae quae voluptates, possimus velit, ipsam modi exercitationem vero quasi? Corrupti?\n      </p>\n    </div>\n  </div>\n</body>\n</html>\n\n\n",
+			"settings":
+			{
+				"buffer_size": 2105,
+				"line_ending": "Windows"
+			}
+		},
+		{
+			"contents": "test\ntest\ntest\n// test\n/*\ntest\n*/\n\n",
+			"settings":
+			{
+				"buffer_size": 35,
+				"line_ending": "Windows"
+			}
+		},
+		{
+			"contents": "$('.user-btn').click(function() {\n  var textin = $('.user-input').val();\n  $('.user-text').text(textin);\n  $('.user-input').val('');\n  $('.user-text').css('font-size','40px')\n  $('.user-text').css('background-color','green')\n  $('.user-text').css('font-weight','solid')\n  $('.user-text').css('width','500px')\n  $('.user-text').css('text-align','center')\n  //this was my attempt to cycle back the text to Replace me!! - but I couldn't get it to delay properly.  So it just appeared that the text never changed.\n  //$('.user-text').text('Replace me!!').delay(5000);\n});\n\n$('.reset-btn').click(function() {\n  $('.user-text').text('Replace me!!');\n  $('.user-text').css('font-size','')\n  $('.user-text').css('background-color','')\n  $('.user-text').css('font-weight','')\n  $('.user-text').css('width','')\n  $('.user-text').css('text-align','')\n});\n\n$('.Replace').delay(100)\n",
+			"settings":
+			{
+				"buffer_size": 870,
+				"line_ending": "Windows"
+			}
+		},
+		{
+			"file": "app.js",
+			"settings":
+			{
+				"buffer_size": 236,
+				"line_ending": "Windows"
+			}
+		}
+	],
+	"build_system": "",
+	"command_palette":
+	{
+		"height": 334.0,
+		"selected_items":
+		[
+			[
+				"Snippet: ",
+				"Snippet: Function"
+			],
+			[
+				"Snippet: get",
+				"Snippet: Get Elements"
+			],
+			[
+				"Snippet: html",
+				"Snippet: html"
+			]
+		],
+		"width": 416.0
+	},
+	"console":
+	{
+		"height": 153.0
+	},
+	"distraction_free":
+	{
+		"menu_visible": true,
+		"show_minimap": false,
+		"show_open_files": false,
+		"show_tabs": false,
+		"side_bar_visible": false,
+		"status_bar_visible": false
+	},
+	"file_history":
+	[
+		"/C/Users/Michael/OneDrive/Documents/Development/Default (Windows).sublime-keymap",
+		"/C/Users/Michael/OneDrive/Downloads/Sublime Text 2.0.2/Data/Packages/User/Default (Windows).sublime-keymap",
+		"/C/Users/Michael/OneDrive/Downloads/test"
+	],
+	"find":
+	{
+		"height": 34.0
+	},
+	"find_in_files":
+	{
+		"height": 0.0,
+		"where_history":
+		[
+		]
+	},
+	"find_state":
+	{
+		"case_sensitive": false,
+		"find_history":
+		[
+			"btn",
+			"-c",
+			".s3cfg"
+		],
+		"highlight": true,
+		"in_selection": false,
+		"preserve_case": false,
+		"regex": false,
+		"replace_history":
+		[
+		],
+		"reverse": false,
+		"show_context": true,
+		"use_buffer2": true,
+		"whole_word": false,
+		"wrap": true
+	},
+	"groups":
+	[
+		{
+			"selected": 6,
+			"sheets":
+			[
+				{
+					"buffer": 0,
+					"file": "/C/Users/Michael/OneDrive/Downloads/monitorS3 (1)",
+					"settings":
+					{
+						"buffer_size": 10058,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								1212,
+								1212
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/ShellScript/Shell-Unix-Generic.tmLanguage"
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"type": "text"
+				},
+				{
+					"buffer": 1,
+					"settings":
+					{
+						"buffer_size": 3702,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								298,
+								298
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/ShellScript/Shell-Unix-Generic.tmLanguage",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"type": "text"
+				},
+				{
+					"buffer": 2,
+					"settings":
+					{
+						"buffer_size": 1519,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								625,
+								625
+							],
+							[
+								645,
+								645
+							],
+							[
+								667,
+								667
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/ShellScript/Shell-Unix-Generic.tmLanguage",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"type": "text"
+				},
+				{
+					"buffer": 3,
+					"settings":
+					{
+						"buffer_size": 2105,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								2105,
+								2105
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/HTML/HTML.tmLanguage",
+							"tab_size": 2,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 473.0,
+						"zoom_level": 1.0
+					},
+					"type": "text"
+				},
+				{
+					"buffer": 4,
+					"settings":
+					{
+						"buffer_size": 35,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								33,
+								33
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/JavaScript/JavaScript.tmLanguage"
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"type": "text"
+				},
+				{
+					"buffer": 5,
+					"settings":
+					{
+						"buffer_size": 870,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								726,
+								726
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/JavaScript/JavaScript.tmLanguage",
+							"tab_size": 2,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 54.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"type": "text"
+				},
+				{
+					"buffer": 6,
+					"file": "app.js",
+					"settings":
+					{
+						"buffer_size": 236,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								236,
+								236
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/JavaScript/JavaScript.tmLanguage"
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"type": "text"
+				}
+			]
+		}
+	],
+	"incremental_find":
+	{
+		"height": 0.0
+	},
+	"input":
+	{
+		"height": 0.0
+	},
+	"layout":
+	{
+		"cells":
+		[
+			[
+				0,
+				0,
+				1,
+				1
+			]
+		],
+		"cols":
+		[
+			0.0,
+			1.0
+		],
+		"rows":
+		[
+			0.0,
+			1.0
+		]
+	},
+	"menu_visible": true,
+	"replace":
+	{
+		"height": 0.0
+	},
+	"save_all_on_build": true,
+	"select_file":
+	{
+		"height": 0.0,
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"select_project":
+	{
+		"height": 0.0,
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"show_minimap": true,
+	"show_open_files": true,
+	"show_tabs": true,
+	"side_bar_visible": true,
+	"side_bar_width": 150.0,
+	"status_bar_visible": true
+}
